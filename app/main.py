@@ -2,8 +2,8 @@ import os
 import tempfile
 import logging
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.staticfiles import StaticFiles
 import httpx
-
 from app.extractor import extract_text
 from app.settings import Settings
 
@@ -14,7 +14,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PDF Text Extractor Service", version="1.0.0")
+app = FastAPI(
+    title="PDF Text Extractor Service",
+    version="1.0.0",
+    swagger_js_url="/static/swagger-ui-bundle.js",
+    swagger_css_url="/static/swagger-ui.css",
+)
+
+# Монтируем папку со статикой — в Dockerfile мы скачали файлы в /app/static
+app.mount("/static", StaticFiles(directory="/app/static"), name="static")
 
 
 @app.post("/extract")

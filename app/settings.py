@@ -4,6 +4,7 @@ class Settings(BaseSettings):
     replicate_api_token: str = ""
     enable_ocr: bool = True
 
+
     external_service_url: str = "http://localhost:8001/process"
 
     max_pdf_size_mb: int = 50

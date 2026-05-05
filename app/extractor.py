@@ -5,10 +5,19 @@ import pdfplumber
 import pymorphy3
 import replicate
 from PIL import Image
+import nltk
+from nltk.corpus import words as nltk_words
 
 # =============================================================================
 # Извлечение текста документов в формате .pdf c учётом таблиц
 # =============================================================================
+
+try:
+    nltk.data.find('corpora/words')
+except LookupError:
+    nltk.download('words', quiet=True)
+
+_ENGLISH_WORDS = set(w.lower() for w in nltk_words.words())
 
 def call_dots_ocr(image: Image.Image) -> str:
     img_bytes = io.BytesIO()
@@ -25,9 +34,36 @@ def call_dots_ocr(image: Image.Image) -> str:
         return output
     else:
         return ' '.join(output)
+
+def is_english_word(word: str) -> bool:
+    return word.lower() in _ENGLISH_WORDS
+
+def is_potential_abbr_part(token, morph_ru):
+    if not token:
+        return False
+    if not re.fullmatch(r'[A-Za-zА-Яа-яЁё0-9]+(?:-[A-Za-zА-Яа-яЁё0-9]+)*', token):
+        return False
+    if morph_ru.word_is_known(token) or is_english_word(token):
+        return False
+    return any(c.isupper() or c.isdigit() for c in token)
+
+def has_camel_case(token):
+    for j in range(len(token)-1):
+        if token[j].islower() and token[j+1].isupper():
+            return True
+    return False
+
+def is_single_letter(token):
+    return len(token) == 1 and token.isalpha()
+
 def merge_split_words(text: str) -> str:
-    morph = pymorphy3.MorphAnalyzer()
+    morph_ru = pymorphy3.MorphAnalyzer()
     words = text.split()
+    RU_SERVICE_WORDS = {
+        'с', 'в', 'к', 'у', 'о', 'и', 'а', 'не', 'ни',
+        'на', 'по', 'за', 'до', 'из', 'от', 'без', 'под',
+        'об', 'обо', 'ко', 'во', 'со', 'ото'
+    }
     if len(words) < 2:
         return text
     merged = []
@@ -35,10 +71,35 @@ def merge_split_words(text: str) -> str:
     while i < len(words):
         if i + 1 < len(words):
             candidate = words[i] + words[i + 1]
-            if morph.word_is_known(candidate):
+            if morph_ru.word_is_known(candidate):
+                if not (words[i].lower() in RU_SERVICE_WORDS or words[i + 1].lower() in RU_SERVICE_WORDS):
+                    merged.append(candidate)
+                    print(f"DEBUG: merging '{words[i]}' + '{words[i + 1]}' -> '{candidate}'", flush=True)
+                    i += 2
+                    continue
+            if is_english_word(candidate):
+                print(f"DEBUG: merging '{words[i]}' + '{words[i + 1]}' -> '{candidate}'", flush=True)
                 merged.append(candidate)
                 i += 2
                 continue
+            if words[i].endswith('-') and not words[i+1].startswith('-'):
+                if not (is_english_word(candidate) or morph_ru.word_is_known(candidate)):
+                    if is_potential_abbr_part(words[i].rstrip('-')) or is_potential_abbr_part(words[i + 1]):
+                        merged.append(candidate)
+                        print(f"DEBUG: merging ABBR-DASH '{words[i]}' + '{words[i + 1]}' -> '{candidate}'", flush=True)
+                        i += 2
+                        continue
+            if (is_potential_abbr_part(words[i]) and is_potential_abbr_part(words[i + 1])) or \
+                    (is_potential_abbr_part(words[i]) and is_single_letter(words[i + 1])) or \
+                    (is_single_letter(words[i]) and is_potential_abbr_part(words[i + 1])):
+                if not (is_english_word(candidate) or morph_ru.word_is_known(candidate)):
+                    if (has_camel_case(words[i]) or has_camel_case(words[i + 1]) or
+                            is_single_letter(words[i]) or is_single_letter(words[i + 1]) or
+                            (words[i][0].isupper() and words[i + 1][0].isupper())):
+                        merged.append(candidate)
+                        print(f"DEBUG: merging ABBR '{words[i]}' + '{words[i + 1]}' -> '{candidate}'", flush=True)
+                        i += 2
+                        continue
         merged.append(words[i])
         i += 1
     return ' '.join(merged)

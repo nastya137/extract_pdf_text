@@ -1,9 +1,15 @@
 FROM python:3.11-slim
 
-# Установка системных зависимостей для pdfplumber/PIL
+# Установка системных зависимостей для pdfplumber/PIL и curl
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg62-turbo \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Скачиваем swagger-ui статику в папку /app/static
+RUN mkdir -p /app/static && \
+    curl -sS https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js -o /app/static/swagger-ui-bundle.js && \
+    curl -sS https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css -o /app/static/swagger-ui.css
 
 WORKDIR /app
 
