@@ -7,6 +7,7 @@ import replicate
 from PIL import Image
 import nltk
 from nltk.corpus import words as nltk_words
+from app.settings import Settings
 
 # =============================================================================
 # Извлечение текста документов в формате .pdf c учётом таблиц
@@ -18,7 +19,27 @@ except LookupError:
     nltk.download('words', quiet=True)
 
 _ENGLISH_WORDS = set(w.lower() for w in nltk_words.words())
+_RUSSIAN_WORDS = {'пао', 'ртк', 'ооо', 'мрф'}
+RU_SERVICE_WORDS = {
+    'с', 'в', 'к', 'у', 'о', 'и', 'а', 'не', 'ни',
+    'на', 'по', 'за', 'до', 'из', 'от', 'без', 'под',
+    'об', 'обо', 'ко', 'во', 'со', 'ото', 'же', 'бы', 'ли',
+    'то', 'что', 'как', 'мы', 'вы', 'он', 'она', 'они', 'его', 'ее', 'их',
+    'но', 'да', 'или', 'уже', 'еще', 'это', 'все', 'всё', 'так', 'для',
+    'от', 'при', 'про', 'над', 'перед', 'через', 'между', 'около', 'вокруг',
+    'из-за', 'из-под', 'и т.д.', 'и т.п.'
+}
+settings = Settings()
+morph_ru = pymorphy3.MorphAnalyzer()
 
+def _has_mixed_scripts_no_camel(text):
+    has_cyrillic = bool(re.search(r'[а-яё]', text, re.I))
+    has_latin = bool(re.search(r'[a-z]', text, re.I))
+    if not (has_cyrillic and has_latin):
+        return False
+    if re.search(r'[a-z][A-Z]|[а-яё][A-Z]|[a-z][А-ЯЁ]', text):
+        return False  # есть граница, ок
+    return True
 def call_dots_ocr(image: Image.Image) -> str:
     img_bytes = io.BytesIO()
     image.save(img_bytes, format='PNG')
@@ -38,6 +59,38 @@ def call_dots_ocr(image: Image.Image) -> str:
 def is_english_word(word: str) -> bool:
     return word.lower() in _ENGLISH_WORDS
 
+import re
+
+def fix_compound_breaks(text: str) -> str:
+    text = re.sub(
+        r'(\w+-)\s+(\w+)\s+(\w+)',
+        lambda m: f'{m.group(1)}{m.group(2)}{m.group(3).lower()}'
+        if m.group(2).isalpha() and len(m.group(2)) <= 3 and m.group(3).isalpha()
+        else m.group(0),
+        text
+    )
+    text = re.sub(
+        r'\b([A-Z][a-z]+)\s+([A-Z][a-z]?)\s+([a-z]{1,2})\b',
+        lambda m: f'{m.group(1)}{m.group(2)}{m.group(3)}'
+        if m.group(2)[0].isupper() and len(m.group(3)) <= 2
+        else m.group(0),
+        text
+    )
+    text = re.sub(
+        r'\b([A-Z][a-z]+)\s+([A-Z][a-z]{1,2})\s+([a-z]{2,})\b',
+        lambda m: f'{m.group(1)}{m.group(2)}{m.group(3)}'
+        if all(c.isalpha() for c in m.group(2) + m.group(3))
+        else m.group(0),
+        text
+    )
+    text = re.sub(
+        r'\b([A-Z][a-z]+)\s+([a-z])([A-Z][a-z]+)\b',
+        lambda m: f'{m.group(1)}{m.group(2).upper()}{m.group(3)}'
+        if len(m.group(2)) == 1 and m.group(2).islower()
+        else m.group(0),
+        text
+    )
+    return text
 
 def is_abbr(token):
     return bool(re.fullmatch(r'[A-ZА-ЯЁ0-9](?:[.A-ZА-ЯЁ0-9])*', token) and
@@ -60,13 +113,7 @@ def is_single_letter(token, RU_SERVICE_WORDS):
     return len(token) == 1 and token.isalpha() and ((token.lower() in RU_SERVICE_WORDS)==False)
 
 def merge_split_words(text: str) -> str:
-    morph_ru = pymorphy3.MorphAnalyzer()
     words = [w for w in text.split() if w]
-    RU_SERVICE_WORDS = {
-        'с', 'в', 'к', 'у', 'о', 'и', 'а', 'не', 'ни',
-        'на', 'по', 'за', 'до', 'из', 'от', 'без', 'под',
-        'об', 'обо', 'ко', 'во', 'со', 'ото'
-    }
     if len(words) < 2:
         return text
 
@@ -87,19 +134,23 @@ def merge_split_words(text: str) -> str:
                 words.pop(i + 1)
                 continue
 
-        if is_english_word(candidate):
-            words[i] = candidate
+        w2_alpha = w2.rstrip('?.,;:!)»')
+        candidate_clean = w1 + w2_alpha
+        if is_english_word(candidate_clean):
+            words[i] = candidate_clean + w2[len(w2_alpha):]
             words.pop(i + 1)
             continue
 
-        if w1.endswith('-') and not w2.startswith('-'):
-            if is_abbr(w1.rstrip('-')) or is_abbr(w2) or is_camel_or_pascal(w1.rstrip('-')) or is_camel_or_pascal(w2):
-                if not (is_english_word(candidate) or morph_ru.word_is_known(candidate)):
-                    words[i] = candidate
-                    words.pop(i + 1)
-                    continue
+        if w1.endswith('-') and not w2.startswith('-') and len(w1) > 1:
+            candidate_no_dash = w1.rstrip('-') + w2
+            if morph_ru.word_is_known(candidate_no_dash) or is_english_word(candidate_no_dash):
+                words[i] = candidate_no_dash
+                words.pop(i + 1)
+                continue
 
         can_merge = False
+        if _has_mixed_scripts_no_camel(candidate):
+            can_merge = False
         if is_abbr(w1) and is_abbr(w2):
             can_merge = True
         elif is_single_letter(w1, RU_SERVICE_WORDS) and (is_abbr(w2) or is_camel_or_pascal(w2)):
@@ -111,6 +162,10 @@ def merge_split_words(text: str) -> str:
             can_merge = True
         elif w1[0].isupper() and w2[0].isupper() and not any(c.islower() for c in w1) and not any(c.islower() for c in w2):
             can_merge = True
+        if w1.lower() in _RUSSIAN_WORDS or w2.lower() in _RUSSIAN_WORDS:
+            can_merge = False
+        if is_english_word(candidate) and bool(re.search(r'[а-яё]', candidate, re.I)):
+            can_merge = False
 
         if can_merge:
             if not (is_english_word(candidate) or morph_ru.word_is_known(candidate)):
@@ -119,7 +174,7 @@ def merge_split_words(text: str) -> str:
                     words.pop(i + 1)
                     continue
         i += 1
-    return ' '.join(words)
+    return fix_compound_breaks(' '.join(words))
 
 def extract_text(path):
     pages_text = []
@@ -148,7 +203,7 @@ def extract_text(path):
                 cells = t.extract()
                 if not cells:
                     continue
-                cell_bboxes = t.cells if hasattr(t, 'cells') else None
+                num_cols = len(cells[0]) if cells else 0
                 rows_text = []
                 for i, row in enumerate(cells):
                     row_parts = []
@@ -157,13 +212,18 @@ def extract_text(path):
                             row_parts.append('')
                             continue
                         cell_clean = ' '.join(cell.split())
-                        if ' ' not in cell_clean and len(cell_clean) > 15:
-                            if cell_bboxes and i < len(cell_bboxes) and j < len(cell_bboxes[i]):
-                                bbox_raw = cell_bboxes[i][j]
-                                if isinstance(bbox_raw, dict):
-                                    bbox = (bbox_raw.get('x0'), bbox_raw.get('top'),
-                                            bbox_raw.get('x1'), bbox_raw.get('bottom'))
-                                elif isinstance(bbox_raw, (list, tuple)) and len(bbox_raw) == 4:
+                        has_long_unknown = any(
+                            len(tok) > 15
+                            and re.fullmatch(r'[а-яёА-ЯЁa-zA-Z]+', tok)
+                            and not morph_ru.word_is_known(tok)
+                            and not is_english_word(tok)
+                            for tok in cell_clean.split()
+                        )
+                        if has_long_unknown:
+                            cell_idx = i * num_cols + j
+                            if t.cells and cell_idx < len(t.cells):
+                                bbox_raw = t.cells[cell_idx]
+                                if isinstance(bbox_raw, (list, tuple)) and len(bbox_raw) == 4:
                                     bbox = tuple(bbox_raw)
                                 else:
                                     bbox = None
@@ -187,5 +247,5 @@ def extract_text(path):
             page_text = '\n'.join(text for _, text in all_items)
             pages_text.append(page_text)
     text = '\n'.join(pages_text)
-    text = re.sub(r"([А-Яа-яЁёA-Za-z])\-\s*\n\s*([А-Яа-яЁёA-Za-z])", r"\1\2", text)
+    text = re.sub(r'\?([А-ЯЁA-Za-z])', r'? \1', text)
     return text
