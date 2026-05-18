@@ -32,6 +32,16 @@ RU_SERVICE_WORDS = {
 settings = Settings()
 morph_ru = pymorphy3.MorphAnalyzer()
 
+
+def build_document_vocabulary(text: str) -> set:
+    vocab = set()
+    for word in re.findall(r'[а-яёА-ЯЁa-zA-Z]{6,}', text):
+        w_low = word.lower()
+        if (not morph_ru.word_is_known(w_low)
+                and not is_english_word(w_low)):
+            vocab.add(w_low)
+    return vocab
+
 def _has_mixed_scripts_no_camel(text):
     has_cyrillic = bool(re.search(r'[а-яё]', text, re.I))
     has_latin = bool(re.search(r'[a-z]', text, re.I))
@@ -40,6 +50,8 @@ def _has_mixed_scripts_no_camel(text):
     if re.search(r'[a-z][A-Z]|[а-яё][A-Z]|[a-z][А-ЯЁ]', text):
         return False  # есть граница, ок
     return True
+
+
 def call_dots_ocr(image: Image.Image) -> str:
     img_bytes = io.BytesIO()
     image.save(img_bytes, format='PNG')
@@ -56,10 +68,10 @@ def call_dots_ocr(image: Image.Image) -> str:
     else:
         return ' '.join(output)
 
+
 def is_english_word(word: str) -> bool:
     return word.lower() in _ENGLISH_WORDS
 
-import re
 
 def fix_compound_breaks(text: str) -> str:
     text = re.sub(
@@ -92,9 +104,46 @@ def fix_compound_breaks(text: str) -> str:
     )
     return text
 
+def split_glued_russian(text: str, doc_vocab: set = None, min_len: int = 14, max_word: int = 20) -> str:
+    def segment(s):
+        s_low = s.lower()
+        n = len(s_low)
+        dp = [None] * (n + 1)
+        dp[0] = []
+        for i in range(1, n + 1):
+            for j in range(max(0, i - max_word), i):
+                if dp[j] is None:
+                    continue
+                chunk = s_low[j:i]
+                if morph_ru.word_is_known(chunk) or chunk in RU_SERVICE_WORDS:
+                    if dp[i] is None or len(dp[j]) + 1 < len(dp[i]):
+                        dp[i] = dp[j] + [(j, i)]
+        return dp[n]
+
+    result_tokens = []
+    for tok in text.split():
+        core = tok.rstrip('.,;:!?»)')
+        suffix = tok[len(core):]
+        if (len(core) >= min_len
+                and re.fullmatch(r'[а-яёА-ЯЁ]+', core)
+                and not morph_ru.word_is_known(core.lower())
+                and (doc_vocab is None or core.lower() not in doc_vocab)):
+            spans = segment(core)
+            if spans and len(spans) > 1:
+                parts = [core[s:e] for s, e in spans]
+                if core[0].isupper():
+                    parts[0] = parts[0].capitalize()
+                result_tokens.extend(parts)
+                if suffix:
+                    result_tokens[-1] += suffix
+                continue
+        result_tokens.append(tok)
+    return ' '.join(result_tokens)
+
 def is_abbr(token):
     return bool(re.fullmatch(r'[A-ZА-ЯЁ0-9](?:[.A-ZА-ЯЁ0-9])*', token) and
                 any(c.isupper() for c in token))
+
 
 def is_camel_or_pascal(token):
     if not token:
@@ -109,10 +158,12 @@ def is_camel_or_pascal(token):
         return True
     return False
 
-def is_single_letter(token, RU_SERVICE_WORDS):
-    return len(token) == 1 and token.isalpha() and ((token.lower() in RU_SERVICE_WORDS)==False)
 
-def merge_split_words(text: str) -> str:
+def is_single_letter(token, RU_SERVICE_WORDS):
+    return len(token) == 1 and token.isalpha() and ((token.lower() in RU_SERVICE_WORDS) == False)
+
+
+def merge_split_words(text: str, doc_vocab: set = None) -> str:
     words = [w for w in text.split() if w]
     if len(words) < 2:
         return text
@@ -121,23 +172,32 @@ def merge_split_words(text: str) -> str:
     while i < len(words) - 1:
         w1 = words[i]
         w2 = words[i + 1]
-        candidate = w1 + w2
-
-        if morph_ru.word_is_known(candidate):
-            if w1.lower() not in RU_SERVICE_WORDS and w2.lower() not in RU_SERVICE_WORDS:
-                words[i] = candidate
-                words.pop(i + 1)
-                continue
-            elif (w1.lower() in RU_SERVICE_WORDS and not morph_ru.word_is_known(w2)) or \
-                 (w2.lower() in RU_SERVICE_WORDS and not morph_ru.word_is_known(w1)):
-                words[i] = candidate
-                words.pop(i + 1)
-                continue
+        if w1.endswith('?'):
+            i += 1
+            continue
 
         w2_alpha = w2.rstrip('?.,;:!)»')
         candidate_clean = w1 + w2_alpha
+        punct_suffix = w2[len(w2_alpha):]
+
+        if morph_ru.word_is_known(candidate_clean):
+            if w1.lower() not in RU_SERVICE_WORDS and w2_alpha.lower() not in RU_SERVICE_WORDS:
+                words[i] = candidate_clean + punct_suffix
+                words.pop(i + 1)
+                continue
+            elif (w1.lower() in RU_SERVICE_WORDS and not morph_ru.word_is_known(w2_alpha)) or \
+                    (w2_alpha.lower() in RU_SERVICE_WORDS and not morph_ru.word_is_known(w1)):
+                words[i] = candidate_clean + punct_suffix
+                words.pop(i + 1)
+                continue
+
         if is_english_word(candidate_clean):
-            words[i] = candidate_clean + w2[len(w2_alpha):]
+            words[i] = candidate_clean + punct_suffix
+            words.pop(i + 1)
+            continue
+
+        if doc_vocab and candidate_clean.lower() in doc_vocab:
+            words[i] = candidate_clean + punct_suffix
             words.pop(i + 1)
             continue
 
@@ -148,35 +208,49 @@ def merge_split_words(text: str) -> str:
                 words.pop(i + 1)
                 continue
 
+        w2_core = w2_alpha
+
         can_merge = False
-        if _has_mixed_scripts_no_camel(candidate):
+        if _has_mixed_scripts_no_camel(candidate_clean):
             can_merge = False
-        if is_abbr(w1) and is_abbr(w2):
+        elif is_abbr(w1) and is_abbr(w2_core):
             can_merge = True
-        elif is_single_letter(w1, RU_SERVICE_WORDS) and (is_abbr(w2) or is_camel_or_pascal(w2)):
+        elif is_single_letter(w1, RU_SERVICE_WORDS) and (is_abbr(w2_core) or is_camel_or_pascal(w2_core)):
             can_merge = True
-        elif is_single_letter(w2, RU_SERVICE_WORDS) and (is_abbr(w1) or is_camel_or_pascal(w1)):
+        elif is_single_letter(w2_core, RU_SERVICE_WORDS) and (is_abbr(w1) or is_camel_or_pascal(w1)):
             can_merge = True
-        elif (is_camel_or_pascal(w1) and (is_abbr(w2) or is_camel_or_pascal(w2))) or \
-             (is_camel_or_pascal(w2) and (is_abbr(w1) or is_camel_or_pascal(w1))):
+        elif (is_camel_or_pascal(w1) and (is_abbr(w2_core) or is_camel_or_pascal(w2_core))) or \
+                (is_camel_or_pascal(w2_core) and (is_abbr(w1) or is_camel_or_pascal(w1))):
             can_merge = True
-        elif w1[0].isupper() and w2[0].isupper() and not any(c.islower() for c in w1) and not any(c.islower() for c in w2):
+        elif w1 and w2_core and \
+                w1[0].isupper() and w2_core[0].isupper() and \
+                not any(c.islower() for c in w1) and not any(c.islower() for c in w2_core):
             can_merge = True
+
         if w1.lower() in _RUSSIAN_WORDS or w2.lower() in _RUSSIAN_WORDS:
             can_merge = False
-        if is_english_word(candidate) and bool(re.search(r'[а-яё]', candidate, re.I)):
+        if is_english_word(candidate_clean) and bool(re.search(r'[а-яё]', candidate_clean, re.I)):
             can_merge = False
 
         if can_merge:
-            if not (is_english_word(candidate) or morph_ru.word_is_known(candidate)):
-                if not (any(c.islower() for c in w1) and w2[0].isupper() and len(w1) > 1 and len(w2) > 1):
-                    words[i] = candidate
+            if not (is_english_word(candidate_clean) or morph_ru.word_is_known(candidate_clean)):
+                if not (any(c.islower() for c in w1) and w2_core and w2_core[0].isupper()
+                        and len(w1) > 1 and len(w2_core) > 1):
+                    words[i] = candidate_clean + punct_suffix
                     words.pop(i + 1)
                     continue
         i += 1
     return fix_compound_breaks(' '.join(words))
 
+
 def extract_text(path):
+    raw_pages = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                raw_pages.append(t)
+    doc_vocab = build_document_vocabulary('\n'.join(raw_pages))
     pages_text = []
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
@@ -194,7 +268,7 @@ def extract_text(path):
                 inside = False
                 for tx0, ty0, tx1, ty1 in table_bboxes:
                     if (line['x0'] >= tx0 and line['x1'] <= tx1 and
-                        line['top'] >= ty0 and line['bottom'] <= ty1):
+                            line['top'] >= ty0 and line['bottom'] <= ty1):
                         inside = True
                         break
                 if not inside:
@@ -238,7 +312,8 @@ def extract_text(path):
                         row_parts.append(cell_clean)
                     row_text = ' '.join(row_parts).strip()
                     if row_text:
-                        row_text = merge_split_words(row_text)
+                        row_text = split_glued_russian(row_text, doc_vocab=doc_vocab)
+                        row_text = merge_split_words(row_text, doc_vocab=doc_vocab)
                         rows_text.append(row_text)
                 y0 = t.bbox[1]
                 for idx, row_text in enumerate(rows_text):
